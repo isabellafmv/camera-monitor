@@ -9,9 +9,10 @@ Works on macOS (ffmpeg + uvcc, see link2_control.py) and Windows (DirectShow,
 see link2_windows.py). Calibrate on the computer that will do the monitoring.
 
 Setup
-  Aim the camera at the gauge, zoomed in so the dial is big:
-    macOS: python link2_keys.py      Windows: py link2_windows.py (close it afterwards)
-  python gauge_monitor.py calibrate      # click: dial center, dial rim, scale zero
+  python gauge_monitor.py calibrate      # aim, then click: dial center, dial rim, scale zero
+    Aim so the dial is big in the picture. Windows: calibrate opens a live view
+    with the steering keys - aim there and press SPACE. macOS: aim beforehand
+    with python link2_keys.py (it can stay open).
   Webhook for alerts:
     macOS: export GAUGE_WEBHOOK_URL=https://hooks.slack.com/services/...
     Windows: setx GAUGE_WEBHOOK_URL "https://hooks.slack.com/services/..." (then open a new terminal)
@@ -65,6 +66,9 @@ MIN_MARK_PIXELS = 15
 MIN_NEEDLE_CONTRAST = 25  # gray levels darker than the typical angle
 MIN_FRAME_BRIGHTNESS = 15
 PTZ_SETTLE_S = 2
+REFERENCE_PATH = HERE / "gauge_reference.png"
+ALIGN_SEARCH = 0.6  # look for the dial up to this many radii away from where it was
+ALIGN_MIN_SCORE = 0.5  # template match below this = the gauge isn't in view
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 VERDICT_COLORS = {"OK": (0, 180, 0), "COVERED": (0, 180, 255), "LOW": (0, 0, 255), "UNKNOWN": (128, 128, 128)}
@@ -290,9 +294,7 @@ def _grab_windows(restore_ptz, camera_index):
     try:
         if restore_ptz:
             try:
-                if any(abs(cam.get(axis) - value) > 0.5 for axis, value in restore_ptz.items()):
-                    cam.set_ptz(restore_ptz)
-                    time.sleep(PTZ_SETTLE_S)
+                cam.aim(restore_ptz)  # always: the parked Link 2 misreports where it points
             except Exception as e:
                 print(f"  (couldn't restore camera position: {e})")
         frame = cam.grab()
@@ -304,16 +306,89 @@ def _grab_windows(restore_ptz, camera_index):
         cam.close()
 
 
-def take_reading(cfg, image_path=None, use_ptz=True, camera_index=None):
+def reference_crop(frame, cfg):
+    """Grayscale square around the dial, saved at calibration to recognise the view later."""
+    (cx, cy), pad = cfg["center"], int(cfg["radius"] * 1.2)
+    x0, y0 = max(cx - pad, 0), max(cy - pad, 0)
+    crop = cv2.cvtColor(frame[y0:cy + pad, x0:cx + pad], cv2.COLOR_BGR2GRAY)
+    return crop, [x0, y0]
+
+
+def align(frame, cfg, reference):
+    """Find the calibrated dial in this frame; returns (cfg with corrected center, shift)
+    or (cfg, error) when the camera isn't looking at the gauge."""
+    x0, y0 = cfg["reference_origin"]
+    h, w = reference.shape
+    pad = int(cfg["radius"] * ALIGN_SEARCH)
+    sx, sy = max(x0 - pad, 0), max(y0 - pad, 0)
+    window = cv2.cvtColor(frame[sy:y0 + h + pad, sx:x0 + w + pad], cv2.COLOR_BGR2GRAY)
+    if window.shape[0] < h or window.shape[1] < w:
+        return cfg, "camera image is smaller than at calibration"
+    scores = cv2.matchTemplate(window, reference, cv2.TM_CCOEFF_NORMED)
+    _, score, _, (mx, my) = cv2.minMaxLoc(scores)
+    if score < ALIGN_MIN_SCORE:
+        return cfg, f"camera isn't looking at the gauge (view match {score:.2f})"
+    dx, dy = sx + mx - x0, sy + my - y0
+    return dict(cfg, center=[cfg["center"][0] + dx, cfg["center"][1] + dy]), (dx, dy)
+
+
+class FrameSource:
+    """Where readings get their frames: a photo, a one-off camera grab, or (Windows
+    `run`) a camera kept open between checks.
+
+    Keeping the camera open matters on Windows: every close makes the Link 2 park
+    itself, and every open costs a wake-up + re-aim of several seconds.
+    """
+
+    def __init__(self, cfg, image_path=None, use_ptz=True, camera_index=None, keep_open=False):
+        self.image_path, self.camera_index = image_path, camera_index
+        self.ptz = cfg.get("ptz") if use_ptz else None
+        self.keep_open = keep_open and sys.platform == "win32" and not image_path
+        self.cam = None
+
+    def frame(self, reaim=False):
+        if self.image_path:
+            return read_image(self.image_path)
+        if not self.keep_open:
+            return grab_frame(self.ptz, self.camera_index)[0]
+        try:
+            if self.cam is None:
+                from link2_windows import Camera
+                self.cam, reaim = Camera(self.camera_index), True
+            if reaim and self.ptz:
+                self.cam.aim(self.ptz)
+            self.cam.flush(0.5)  # drop frames buffered since the last check
+            return self.cam.grab(warmup=2)
+        except Exception:
+            self.close()  # reopen from scratch next time
+            raise
+
+    def close(self):
+        if self.cam is not None:
+            self.cam.close()
+            self.cam = None
+
+
+def take_reading(cfg, source):
     """One full check. Never raises: failures come back as UNKNOWN."""
+    reference = cv2.imread(str(REFERENCE_PATH), cv2.IMREAD_GRAYSCALE) if cfg.get("reference_origin") else None
     try:
-        if image_path:
-            frame = read_image(image_path)
-        else:
-            frame, _ = grab_frame(cfg.get("ptz") if use_ptz else None, camera_index)
+        frame = source.frame()
+        if reference is not None and isinstance(align(frame, cfg, reference)[1], str) and not source.image_path:
+            frame = source.frame(reaim=True)  # something moved the camera - point it back and look again
     except Exception as e:
         return {"verdict": "UNKNOWN", "reason": f"capture failed: {e}", "diff": None}, None
+
+    if reference is not None:
+        cfg, shift = align(frame, cfg, reference)
+        if isinstance(shift, str):
+            result = {"verdict": "UNKNOWN", "reason": shift, "needle_angle": None, "mark_angle": None, "diff": None}
+            return result, save_snapshot(annotate(frame, cfg, result), "UNKNOWN")
+    else:
+        shift = None
     result = analyze(frame, cfg)
+    if shift and max(map(abs, shift)) > 2:
+        result["reason"] = f"{result['reason']} (view shifted {shift[0]:+d},{shift[1]:+d} px, corrected)".strip()
     return result, save_snapshot(annotate(frame, cfg, result), result["verdict"])
 
 
@@ -350,11 +425,32 @@ def click_points(frame):
     return pts
 
 
+def aim_and_grab(camera_index):
+    """Windows: steer in a live view and capture with the camera still open.
+
+    Closing the camera between aiming and capturing makes the Link 2 park
+    itself, so aiming has to happen here rather than in link2_windows.py.
+    """
+    from link2_windows import Camera, steer
+    cam = Camera(camera_index)
+    try:
+        print("Aim at the gauge (A/D/W/S, Z/X, 1-9 step size), then press SPACE. Esc cancels.")
+        got = steer(cam, capture=True)
+        if got is None:
+            sys.exit("Calibration cancelled.")
+        return got
+    finally:
+        cam.close()
+
+
 def cmd_calibrate(args):
     if args.image:
         frame, ptz = read_image(args.image), None
     else:
-        frame, ptz = grab_frame(camera_index=args.camera_index)
+        if sys.platform == "win32":
+            frame, ptz = aim_and_grab(args.camera_index)
+        else:
+            frame, ptz = grab_frame(camera_index=args.camera_index)
         if ptz is None:
             print("(couldn't read camera position, it won't be restored before checks)")
     if args.points:
@@ -389,8 +485,10 @@ def cmd_calibrate(args):
         cv2.destroyAllWindows()
         if key not in (13, 10):
             sys.exit("Not saved.")
+    reference, cfg["reference_origin"] = reference_crop(frame, cfg)
+    cv2.imwrite(str(REFERENCE_PATH), reference)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-    print(f"Saved {CONFIG_PATH.name}")
+    print(f"Saved {CONFIG_PATH.name} and {REFERENCE_PATH.name}")
 
 
 def format_reading(result):
@@ -402,7 +500,8 @@ def format_reading(result):
 
 
 def cmd_check(args):
-    result, snap = take_reading(load_config(), args.image, not args.no_ptz, args.camera_index)
+    cfg = load_config()
+    result, snap = take_reading(cfg, FrameSource(cfg, args.image, not args.no_ptz, args.camera_index))
     print(format_reading(result))
     if snap:
         print(f"snapshot: {snap}")
@@ -442,9 +541,16 @@ def cmd_run(args):
     if args.test_alert:
         send_alert("Test alert from gauge_monitor - the webhook works.")
     print(f"Checking every {args.every} s, reminders every {args.remind_hours} h. Ctrl+C to stop.")
+    source = FrameSource(cfg, args.image, not args.no_ptz, args.camera_index, keep_open=True)
+    try:
+        monitor(cfg, source, state, args)
+    finally:
+        source.close()
 
+
+def monitor(cfg, source, state, args):
     while True:
-        result, snap = take_reading(cfg, args.image, not args.no_ptz, args.camera_index)
+        result, snap = take_reading(cfg, source)
         current = "OK" if result["verdict"] in ("OK", "COVERED") else result["verdict"]
         if current == state["streak_state"]:
             state["streak"] += 1

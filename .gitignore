@@ -1,2 +1,3 @@
 /test-images/
-
+/__pycache__/
+*.py
